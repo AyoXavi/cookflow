@@ -64,6 +64,7 @@ export function Chat({ user, initialMessage, api }: ChatProps) {
     readAs: "DataURL",
     accept: ".png,.jpg",
     multiple: true,
+    initializeWithCustomParameters: (elem) => elem.setAttribute("capture", "environment"),
     onFilesSuccessfullySelected: (data) => {
       setAllPlainFiles(previousPlainFiles => previousPlainFiles.concat(data.plainFiles))
       setAllFilesContent(previousFilesContent => previousFilesContent.concat(data.filesContent))
@@ -264,7 +265,7 @@ export function Chat({ user, initialMessage, api }: ChatProps) {
         speakText('Got it')
       }
       // Send the message
-      await sendMessage({
+      sendMessage({
         text: inputText,
         files: filesPayload,
       })
