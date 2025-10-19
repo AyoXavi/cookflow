@@ -1,6 +1,4 @@
 import App from "@/components/features/App";
-import { Chat } from "@/components/features/Chat";
-import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from "@/components/ui/resizable";
 import { User } from "@/generated/prisma";
 import { auth } from "@/lib/auth";
 import { headers } from "next/headers";
