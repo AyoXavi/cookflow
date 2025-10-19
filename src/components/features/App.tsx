@@ -49,7 +49,7 @@ export default function App({ user }: { user: User }) {
 
   return (
     <AppContext value={({ selectedRecipe, setSelectedRecipe })}>
-      <div className="flex h-screen w-screen">
+      <div className="flex h-screen w-screen flex-col md:flex-row">
         {
           selectedRecipe &&
           <div className="w-full flex-1/12 flex flex-col p-2 px-4 gap-2">
