@@ -6,7 +6,7 @@ import { Label } from "@/components/ui/label"
 import { User } from "@/generated/prisma"
 import { useChat } from "@ai-sdk/react"
 import { DefaultChatTransport, FileUIPart, UIMessage } from "ai"
-import { Mic, Plus, Send, X } from "lucide-react"
+import { Mic, Plus, Send, X, Volume2, Square } from "lucide-react"
 import Image from "next/image"
 import { FormEventHandler, useCallback, useContext, useEffect, useRef, useState } from "react"
 import Markdown from "react-markdown"
@@ -14,6 +14,7 @@ import { useFilePicker } from "use-file-picker"
 import { nanoid } from "nanoid"
 import { AppContext } from "./AppContext"
 import { ParsedRecipe } from "@/lib/types"
+// TTS is implemented client-side via Web Speech API; no extra imports needed
 
 // I hate the devs for not exporting the interfaces...
 type FileContents = ReturnType<typeof useFilePicker<unknown, { readFilesContent: true, readAs: "DataURL" }>>["filesContent"]
@@ -30,13 +31,34 @@ export function Chat({ user, initialMessage, api }: ChatProps) {
       api,
     }),
     experimental_throttle: 100,
+    onError: (error) => {
+      console.error("Chat error:", error)
+    },
+    onFinish: (message) => {
+      console.log("Chat finished:", message)
+    }
   })
 
-  const containerRef = useRef<HTMLDivElement>(null)
-  const inputRef = useRef<HTMLInputElement>(null)
+  // Debug logging for chat status
+  useEffect(() => {
+    console.log("Chat status changed:", status)
+    console.log("Messages count:", messages.length)
+  }, [status, messages])
 
+  const containerRef = useRef<HTMLDivElement>(null)
+  const formRef = useRef<HTMLFormElement>(null)
+  const lastSpokenAssistantIdRef = useRef<string | null>(null)
+  const ttsRef = useRef<{ utter: SpeechSynthesisUtterance | null }>({ utter: null })
+  const lastStatusRef = useRef<string | null>(null)
+
+  const [inputPrompt, setInputPrompt] = useState("")
   const [plainFiles, setAllPlainFiles] = useState<File[]>([])
   const [filesContent, setAllFilesContent] = useState<FileContents>([])
+  const [autoSpeak, setAutoSpeak] = useState(false)
+  const [banner, setBanner] = useState<{ type: 'error' | 'info', text: string } | null>(null)
+  const [isDragging, setIsDragging] = useState(false)
+  const [isAtBottom, setIsAtBottom] = useState(true)
+  const [recordingStartMs, setRecordingStartMs] = useState<number | null>(null)
 
   const { openFilePicker, loading, clear: _pickerClear } = useFilePicker({
     readAs: "DataURL",
@@ -78,22 +100,50 @@ export function Chat({ user, initialMessage, api }: ChatProps) {
     container.scroll(0, container.scrollHeight)
   }, [containerRef])
 
+  // Track scroll position to show a floating "scroll to latest" button
+  useEffect(() => {
+    const el = containerRef.current
+    if (!el) return
+    const onScroll = () => {
+      const threshold = 32
+      const atBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - threshold
+      setIsAtBottom(atBottom)
+    }
+    el.addEventListener('scroll', onScroll)
+    onScroll()
+    return () => el.removeEventListener('scroll', onScroll)
+  }, [])
+
+  // Inline banner auto-dismiss
+  useEffect(() => {
+    if (!banner) return
+    const t = setTimeout(() => setBanner(null), 4000)
+    return () => clearTimeout(t)
+  }, [banner])
+
+  const showBanner = useCallback((text: string, type: 'error' | 'info' = 'info') => {
+    setBanner({ text, type })
+  }, [])
+
   // Recording state
   const [isRecording, setIsRecording] = useState(false)
+  const streamRef = useRef<MediaStream | null>(null)
   const recorderRef = useRef<MediaRecorder | null>(null)
   const audioChunksRef = useRef<Blob[]>([])
+  const [, setRecordingTick] = useState(0) // used to trigger re-renders while recording
 
+  // Start microphone recording
   async function startRecording() {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      streamRef.current = stream
       const mr = new MediaRecorder(stream)
       recorderRef.current = mr
       audioChunksRef.current = []
-
+      setRecordingStartMs(Date.now())
       mr.ondataavailable = (ev: BlobEvent) => {
         if (ev.data && ev.data.size > 0) audioChunksRef.current.push(ev.data)
       }
-
       mr.onstop = async () => {
         const blob = new Blob(audioChunksRef.current, { type: audioChunksRef.current[0]?.type || "audio/webm" })
         // convert blob to data URL
@@ -104,25 +154,30 @@ export function Chat({ user, initialMessage, api }: ChatProps) {
           fr.readAsDataURL(blob)
         })
 
-        // create a File so it matches files picked via file picker
-        const filename = `recording-${nanoid()}.webm`
-        const file = new File([blob], filename, { type: blob.type })
+        const res = await fetch("/api/transcribe", {
+          method: "POST",
+          body: JSON.stringify({
+            dataUrl
+          })
+        }).then(res => res.json() as Promise<{ text?: string, error?: string }>)
 
-        // add to state so it will be included in the next sendMessage
-        setAllPlainFiles(prev => prev.concat(file))
-        // `filesContent` expects objects returned by useFilePicker; minimal compatible shape:
-        const added: FileContents[number] = { name: filename, content: dataUrl } as unknown as FileContents[number]
-        setAllFilesContent(prev => prev.concat(added))
+        if (res?.text) {
+          setInputPrompt(prev => (prev ? prev + ' ' : '') + res.text)
+        } else if (res?.error) {
+          showBanner(`Transcription failed: ${res.error}`, 'error')
+        }
 
         // stop tracks to free mic
         stream.getTracks().forEach(t => t.stop())
+        streamRef.current = null
+        setRecordingStartMs(null)
         scrollToBottom()
       }
-
       mr.start()
       setIsRecording(true)
     } catch (err) {
       console.error("Could not start recording:", err)
+      showBanner('Microphone access failed. Please allow access and try again.', 'error')
     }
   }
 
@@ -133,8 +188,29 @@ export function Chat({ user, initialMessage, api }: ChatProps) {
     } finally {
       setIsRecording(false)
       recorderRef.current = null
+      setRecordingStartMs(null)
     }
   }
+
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      try { recorderRef.current?.stop?.() } catch { }
+      if (streamRef.current) streamRef.current.getTracks().forEach(t => t.stop())
+      recorderRef.current = null
+      setIsRecording(false)
+      setRecordingStartMs(null)
+    }
+  }, [])
+
+  // Recording timer ticker: triggers re-render while recording
+  useEffect(() => {
+    if (!isRecording || !recordingStartMs) return
+    const id = setInterval(() => {
+      setRecordingTick(t => (t + 1) % 1000000)
+    }, 500)
+    return () => clearInterval(id)
+  }, [isRecording, recordingStartMs])
 
   // Scroll to bottom
   useEffect(() => {
@@ -155,36 +231,17 @@ export function Chat({ user, initialMessage, api }: ChatProps) {
     ])
   }, [initialMessage, setMessages])
 
+  // (Removed duplicate startRecording/stopRecording definitions)
+
   // Submit logic
-  async function transcribeAudio() {
-    // find first audio file content
-    const audioIndex = plainFiles.findIndex(f => f.type.startsWith('audio/'))
-    if (audioIndex === -1) return ''
-    const dataUrl = filesContent[audioIndex]?.content
-    if (!dataUrl) return ''
-
-    try {
-      const resp = await fetch('/api/transcribe', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ dataUrl }),
-      })
-      const json = await resp.json()
-      const text = json?.text ?? ''
-      if (inputRef.current) inputRef.current.value = text
-      return text
-    } catch (err) {
-      console.error('Transcription failed:', err)
-      return ''
-    }
-  }
-
   const handleSubmit: FormEventHandler<HTMLFormElement> = async (e) => {
     e.preventDefault()
 
-    if (!inputRef.current || loading) return
+    if (loading) return
 
-    // Build files payload (matches the transport expected shape)
+    const inputText = inputPrompt.trim()
+
+    // Build files payload
     const filesPayload = plainFiles.map((file, index) => ({
       type: "file" as const,
       mediaType: file.type,
@@ -192,37 +249,108 @@ export function Chat({ user, initialMessage, api }: ChatProps) {
       url: filesContent[index]?.content,
     }))
 
-    try {
-      const hasAudio = filesPayload.some(f => f.mediaType?.startsWith?.("audio/"))
-      if (hasAudio) {
-        // ensure transcription present in input before sending
-        await transcribeAudio()
-        await sendMessage({
-          text: inputRef.current?.value ?? '',
-          files: filesPayload,
-          metadata: { authorId: user.id, recorded: true }
-        })
-      } else {
-        // Regular text + files send
-        await sendMessage({
-          text: inputRef.current.value,
-          files: filesPayload,
-          metadata: { authorId: user.id }
-        })
-      }
+    const hasFiles = filesPayload.length > 0
+    const hasText = inputText.length > 0
 
-      // Clear input and previews only after send completes so the UI doesn't drop the preview too early
-      if (inputRef.current) inputRef.current.value = ""
-      clearAll()
-      scrollToBottom()
-    } catch (err) {
-      console.error("Failed to send message:", err)
+    // Validate we have content to send
+    if (!hasText && !hasFiles) {
+      console.log("No content to send")
+      return
     }
+
+    try {
+      // TTS: acknowledge prompt before sending for interactivity
+      if (autoSpeak) {
+        speakText('Got it')
+      }
+      // Send the message
+      await sendMessage({
+        text: inputText,
+        files: filesPayload,
+      })
+    } catch (err) {
+      console.error('Failed to send message:', err)
+      showBanner('Failed to send message. Please try again.', 'error')
+      return
+    }
+
+    // Clear form after successful send
+    setInputPrompt("")
+    clearAll()
+    scrollToBottom()
   }
+
+  // Helper to extract plain text from a UIMessage (used for TTS)
+  const extractTextFromMessage = useCallback((m: UIMessage) => {
+    const full = m.parts
+      .filter(p => p.type === 'text')
+      .map(p => p.text)
+      .join("\n")
+    // Strip markdown artifacts lightly for TTS
+    return full.replace(/[#*_`>\[\]()-]/g, " ").replace(/\s+/g, " ").trim()
+  }, [])
+
+  // TTS helpers
+  const stopSpeaking = useCallback(() => {
+    if (typeof window === 'undefined') return
+    try {
+      window.speechSynthesis?.cancel?.()
+      ttsRef.current.utter = null
+    } catch (e) {
+      console.warn('stopSpeaking failed:', e)
+    }
+  }, [])
+
+  const speakText = useCallback((text: string) => {
+    if (typeof window === 'undefined' || !('speechSynthesis' in window)) return
+    const cleaned = text.replace(/[#*_`>\[\]()-]/g, ' ').replace(/\s+/g, ' ').trim()
+    if (!cleaned) return
+    try {
+      window.speechSynthesis.cancel()
+      const utter = new SpeechSynthesisUtterance(cleaned)
+      ttsRef.current.utter = utter
+      utter.onend = () => { ttsRef.current.utter = null }
+      utter.onerror = () => { ttsRef.current.utter = null }
+      window.speechSynthesis.speak(utter)
+    } catch (e) {
+      console.error('speakText failed:', e)
+    }
+  }, [])
+
+  // Auto-speak the latest assistant message if enabled
+  useEffect(() => {
+    if (!autoSpeak) return
+    if (typeof window === 'undefined' || !('speechSynthesis' in window)) return
+    const lastAssistant = [...messages].reverse().find(m => m.role === 'assistant')
+    if (!lastAssistant || lastSpokenAssistantIdRef.current === lastAssistant.id) return
+
+    const text = extractTextFromMessage(lastAssistant)
+    if (!text) return
+
+    speakText(text)
+    lastSpokenAssistantIdRef.current = lastAssistant.id
+  }, [messages, autoSpeak, extractTextFromMessage, speakText])
+
+  // Pre-response interactivity: speak a short cue when submission starts
+  useEffect(() => {
+    if (!autoSpeak) return
+    if (status !== lastStatusRef.current) {
+      lastStatusRef.current = status
+      if (status === 'submitted') {
+        speakText('Working on it')
+      }
+    }
+  }, [status, autoSpeak, speakText])
 
   return (
     <div className="h-full flex-1 flex flex-col bg-sidebar-primary-foreground">
-      <div className="p-2 flex-1 flex flex-col gap-2 overflow-y-auto" ref={containerRef}>
+      <div className="relative p-2 flex-1 flex flex-col gap-2 overflow-y-auto" ref={containerRef}>
+        {/* Inline banner */}
+        {banner && (
+          <div className={`mb-2 px-3 py-2 rounded-md text-sm ${banner.type === 'error' ? 'bg-red-100 text-red-800' : 'bg-blue-100 text-blue-800'}`}>
+            {banner.text}
+          </div>
+        )}
         {messages.map((message, index) => (
           <ChatMessage
             key={index}
@@ -234,7 +362,7 @@ export function Chat({ user, initialMessage, api }: ChatProps) {
           status === "submitted" &&
           <ChatMessage
             user={user}
-            message={({
+            message={{
               id: "loading",
               role: "assistant",
               parts: [
@@ -243,11 +371,34 @@ export function Chat({ user, initialMessage, api }: ChatProps) {
                   text: "Loading"
                 }
               ]
-            })}
+            }}
           />
         }
+        {/* Scroll-to-bottom floating button */}
+        {!isAtBottom && (
+          <div className="absolute bottom-3 right-3">
+            <Button type="button" variant="secondary" onClick={scrollToBottom}>Jump to latest</Button>
+          </div>
+        )}
       </div>
-      <form onSubmit={handleSubmit}>
+      <form onSubmit={handleSubmit} ref={formRef}
+        onDragOver={(e) => { e.preventDefault(); e.stopPropagation(); setIsDragging(true) }}
+        onDragLeave={() => setIsDragging(false)}
+        onDrop={(e) => {
+          e.preventDefault(); setIsDragging(false)
+          const files = Array.from(e.dataTransfer.files || [])
+          if (!files.length) return
+          files.forEach(file => {
+            const reader = new FileReader()
+            reader.onload = () => {
+              const content = reader.result as string
+              setAllPlainFiles(prev => [...prev, file])
+              setAllFilesContent(prev => [...prev, { name: file.name, content } as FileContents[number]])
+            }
+            reader.readAsDataURL(file)
+          })
+        }}
+      >
         <div className="p-2 flex flex-col justify-center">
           <div className={`${hasFiles ? "flex" : "hidden"} z-0 gap-1 bg-background w-full h-24 relative top-[28px] rounded-xl p-[8px] pb-[36px]`}>
             {
@@ -277,6 +428,12 @@ export function Chat({ user, initialMessage, api }: ChatProps) {
                 </div>
               ))
             }
+            {/* Drag overlay */}
+            {isDragging && (
+              <div className="absolute inset-0 rounded-xl border-2 border-dashed border-blue-400 bg-blue-50/50 flex items-center justify-center text-blue-700">
+                Drop files to attach
+              </div>
+            )}
           </div>
           <Label className="p-2 h-16 shadow-sm rounded-xl bg-background w-full flex gap-1 relative z-10">
             <Button variant="ghost" className="rounded-full" onClick={openFilePicker} type="button">
@@ -290,21 +447,47 @@ export function Chat({ user, initialMessage, api }: ChatProps) {
             >
               <Mic className={`${isRecording ? "bg-red-500" : "bg-none"}`} />
             </Button>
-            {/* Recording indicator */}
+            {/* Auto-speak toggle */}
+            <Button
+              variant="ghost"
+              className={`rounded-full ${autoSpeak ? 'text-blue-600' : ''}`}
+              type="button"
+              title={autoSpeak ? 'Auto-speak: on' : 'Auto-speak: off'}
+              onClick={() => setAutoSpeak(v => !v)}
+            >
+              <Volume2 />
+            </Button>
+            {/* Stop speaking (barge-in) */}
+            <Button
+              variant="ghost"
+              className="rounded-full"
+              type="button"
+              title="Stop speaking"
+              onClick={stopSpeaking}
+            >
+              <Square />
+            </Button>
+            {/* Recording indicator with timer */}
             <div className="flex items-center gap-2 px-2">
               {isRecording && (
                 <div className="flex items-center gap-2 text-sm text-red-600">
                   <span className="h-3 w-3 rounded-full bg-red-600 animate-pulse" />
-                  <span>Recording...</span>
+                  <span>Recording{recordingStartMs ? ` ${new Date(Date.now() - recordingStartMs).toISOString().slice(14, 19)}` : '...'}</span>
                 </div>
               )}
             </div>
             <Input
               placeholder="Ask about meals or ingredients..."
               className="shadow-none border-none focus-visible:ring-ring/0"
-              // minLength={10}
-              required
-              ref={inputRef}
+              value={inputPrompt}
+              onChange={e => setInputPrompt(e.target.value)}
+              onKeyDown={(e) => {
+                if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+                  e.preventDefault()
+                  formRef.current?.requestSubmit?.()
+                }
+              }}
+            // minLength={10}
             />
             <Button type="submit" variant="ghost">
               <Send />
@@ -361,7 +544,25 @@ function ChatMessage({
       className={`w-full flex flex-col gap-2 ${isOwnMessage ? "items-end" : "items-start"} justify-end`}
     >
       <div className="flex gap-2">
-        <Label>{authorName}</Label>
+        <Label className="flex items-center gap-2">{authorName}
+          {isBot && (
+            <>
+              <Button size="icon" variant="ghost" onClick={() => {
+                const text = message.parts.filter(p => p.type === 'text').map(p => p.text).join('\n').replace(/[#*_`>\[\]()-]/g, ' ').replace(/\s+/g, ' ').trim()
+                if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+                  window.speechSynthesis.cancel()
+                  const u = new SpeechSynthesisUtterance(text)
+                  window.speechSynthesis.speak(u)
+                }
+              }}>
+                <Volume2 />
+              </Button>
+              <Button size="icon" variant="ghost" onClick={() => { if (typeof window !== 'undefined') window.speechSynthesis?.cancel?.() }}>
+                <Square />
+              </Button>
+            </>
+          )}
+        </Label>
       </div>
       <div className={`flex gap-2 justify-end ${!isOwnMessage ? "flex-row-reverse" : ""} w-full`}>
         <div className="max-w-1/2 flex flex-col gap-2">
